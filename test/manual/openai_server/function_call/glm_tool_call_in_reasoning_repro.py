@@ -30,10 +30,17 @@ STOP_TOKENS = ("<|user|>", "<|observation|>", "<|endoftext|>")
 
 
 def classify_names(names, declared):
-    bad = [n for n in names if n not in declared]
+    """``malformed``: a non-empty name the request never declared.
+
+    ``phantom_call``: a call that streamed arguments (``{}``) but no name. That
+    happens when the tool parser saw ``<tool_call>`` but never a complete name,
+    and the end-of-stream flush sent the placeholder's arguments anyway.
+    """
+    bad = [n for n in names if n and n not in declared]
     return {
         "bad_names": bad,
         "malformed": bool(bad),
+        "phantom_call": any(not n for n in names),
         "name_has_think_end": any("</think>" in n for n in names),
         "name_has_tool_call": any("<tool_call>" in n for n in names),
         "name_has_whitespace": any(any(c.isspace() for c in n) for n in names),
@@ -310,7 +317,31 @@ def replay_row(row, tokenizer, tools, force_reasoning):
             slot = calls.setdefault(item.tool_index, {"name": "", "arguments": ""})
             slot["name"] += item.name or ""
             slot["arguments"] += item.parameters or ""
+    flush_error = None
+    if tools:
+        # serving_chat._check_for_unstreamed_tool_args: after the last chunk it
+        # sends whatever arguments the detector recorded but did not stream,
+        # under the last recorded index and without a name.
+        detector = tool_parser.detector
+        records = getattr(detector, "prev_tool_call_arr", None) or []
+        streamed = getattr(detector, "streamed_args_for_tool", None) or []
+        index = len(records) - 1
+        if 0 <= index < len(streamed):
+            expected = records[index].get("arguments", {})
+            if not isinstance(expected, str):
+                try:
+                    expected = json.dumps(expected, ensure_ascii=False)
+                except TypeError as error:  # e.g. "..." parsed to Ellipsis
+                    flush_error = repr(error)
+                    expected = streamed[index]
+            if (
+                expected.startswith(streamed[index])
+                and expected[len(streamed[index]) :]
+            ):
+                slot = calls.setdefault(index, {"name": "", "arguments": ""})
+                slot["arguments"] += expected[len(streamed[index]) :]
     streaming = {
+        "flush_error": flush_error,
         "reasoning_content": "".join(reasoning),
         "content": "".join(content),
         "tool_calls": [calls[i] for i in sorted(calls)],
@@ -408,7 +439,9 @@ def cmd_replay_summary(args):
                         "faithful",
                         "mention",
                         "text_mention",
+                        "stream_any",
                         "stream_defect",
+                        "stream_nameless",
                         "one_shot_defect",
                         "reasoning_equal",
                         "calls_equal",
@@ -429,6 +462,13 @@ def cmd_replay_summary(args):
                 > row["tool_call_special_ids_before_think_end"]
             )
             cell["stream_defect"] += stream_flags["defect"]
+            nameless = row["streaming_class"].get("phantom_call", False)
+            cell["stream_nameless"] += nameless
+            cell["stream_any"] += (
+                stream_flags["defect"]
+                or nameless
+                or stream["reasoning_content"] != one["reasoning_content"]
+            )
             cell["one_shot_defect"] += row["one_shot_class"]["malformed"]
             cell["reasoning_equal"] += (
                 stream["reasoning_content"] == one["reasoning_content"]
@@ -438,24 +478,62 @@ def cmd_replay_summary(args):
             ]
     print(
         "label\tprompt\tn\treplay==server(json)\t<tool_call>-id-in-reasoning"
-        "\ttext-only-mention\tstreaming-defect\tone-shot-defect"
-        "\tstream-reasoning==one-shot\tstream-call-names==one-shot"
+        "\ttext-only-mention\tSTREAMING-ANY-DEFECT\tstreaming-malformed-or-leak"
+        "\tstreaming-nameless\tone-shot-defect\tstream-reasoning==one-shot"
+        "\tstream-call-names==one-shot"
     )
     for key in sorted(cells):
         c = cells[key]
+        cols = (
+            "n",
+            "faithful",
+            "mention",
+            "text_mention",
+            "stream_any",
+            "stream_defect",
+            "stream_nameless",
+            "one_shot_defect",
+            "reasoning_equal",
+            "calls_equal",
+        )
+        print("\t".join(key) + "".join(f"\t{c[k]}" for k in cols))
+
+
+def cmd_latency(args):
+    """Client-side stream timing per cell: median / p90 / max seconds."""
+    cells = {}
+    for path in args.rows:
+        for line in open(path):
+            row = json.loads(line)
+            if not row["stream"] or row.get("status") != 200:
+                continue
+            key = (row["label"], row["prompt"], row["sampling"], row["concurrency"])
+            cells.setdefault(key, []).append(row)
+
+    def stats(values):
+        values = sorted(v for v in values if v is not None)
+        if not values:
+            return "-"
+        p90 = values[max(0, int(0.9 * len(values)) - 1)]
+        return f"{values[len(values) // 2]:.2f}/{p90:.2f}/{values[-1]:.2f}"
+
+    print(
+        "label\tprompt\tsampling\tconc\tn\tfirst_reasoning_s\tfirst_answer_s"
+        "\telapsed_s\tmax_gap_s\tmax_reasoning_chunk_chars"
+    )
+    for key in sorted(cells):
+        rows = cells[key]
         print(
-            "\t".join(key)
+            "\t".join(map(str, key))
+            + f"\t{len(rows)}"
             + "".join(
-                f"\t{c[k]}"
+                "\t" + stats([r.get(k) for r in rows])
                 for k in (
-                    "n",
-                    "faithful",
-                    "mention",
-                    "text_mention",
-                    "stream_defect",
-                    "one_shot_defect",
-                    "reasoning_equal",
-                    "calls_equal",
+                    "first_reasoning_s",
+                    "first_answer_s",
+                    "elapsed_s",
+                    "max_gap_s",
+                    "max_reasoning_chunk_chars",
                 )
             )
         )
@@ -496,6 +574,7 @@ def cmd_summarize(args):
                         "malformed",
                         "leak",
                         "defect",
+                        "phantom",
                         "runaway",
                         "args",
                         "errors",
@@ -506,17 +585,20 @@ def cmd_summarize(args):
             cell["malformed"] += bool(row.get("malformed"))
             cell["leak"] += bool(row.get("reasoning_leak"))
             cell["defect"] += bool(row.get("defect"))
+            cell["phantom"] += bool(row.get("phantom_call"))
             cell["runaway"] += bool(row.get("runaway"))
             cell["args"] += bool(row.get("args_have_think_end"))
             cell["errors"] += row.get("status") != 200
     print(
         "label\tprompt\tmode\ttools\tsampling\tconc\tDEFECT\tmalformed_name"
-        "\treasoning_leak\t|model:runaway\targs_think_end\terrors"
+        "\treasoning_leak\tnameless_call\t|model:runaway\targs_think_end\terrors"
     )
     for key in sorted(cells):
         c = cells[key]
         n = c["n"]
-        cols = [c[k] for k in ("defect", "malformed", "leak", "runaway", "args")]
+        cols = [
+            c[k] for k in ("defect", "malformed", "leak", "phantom", "runaway", "args")
+        ]
         print(
             "\t".join(map(str, key))
             + "".join(f"\t{v}/{n}" for v in cols)
@@ -560,6 +642,10 @@ def main(argv=None):
     replay_summary = sub.add_parser("replay-summary")
     replay_summary.add_argument("rows", nargs="+")
     replay_summary.set_defaults(func=cmd_replay_summary)
+
+    latency = sub.add_parser("latency")
+    latency.add_argument("rows", nargs="+")
+    latency.set_defaults(func=cmd_latency)
 
     summarize = sub.add_parser("summarize")
     summarize.add_argument("rows", nargs="+")
